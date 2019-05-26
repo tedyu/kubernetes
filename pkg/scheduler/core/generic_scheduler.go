@@ -1142,13 +1142,15 @@ func unresolvablePredicateExists(failedPredicates []predicates.PredicateFailureR
 func nodesWherePreemptionMightHelp(nodes []*v1.Node, failedPredicatesMap FailedPredicateMap) []*v1.Node {
 	potentialNodes := []*v1.Node{}
 	for _, node := range nodes {
-		failedPredicates, _ := failedPredicatesMap[node.Name]
+		failedPredicates, found := failedPredicatesMap[node.Name]
 		// If we assume that scheduler looks at all nodes and populates the failedPredicateMap
 		// (which is the case today), the !found case should never happen, but we'd prefer
 		// to rely less on such assumptions in the code when checking does not impose
 		// significant overhead.
 		// Also, we currently assume all failures returned by extender as resolvable.
-		if !unresolvablePredicateExists(failedPredicates) {
+		if !found && failedPredicates != nil {
+			klog.V(3).Infof("Node %v has %v failed predicates", node.Name, len(failedPredicates))
+		} else if !unresolvablePredicateExists(failedPredicates) {
 			klog.V(3).Infof("Node %v is a potential node for preemption.", node.Name)
 			potentialNodes = append(potentialNodes, node)
 		}
