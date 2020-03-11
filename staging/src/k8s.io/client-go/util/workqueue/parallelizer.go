@@ -33,23 +33,26 @@ func ParallelizeUntil(ctx context.Context, workers, pieces int, doWorkPiece DoWo
 		stop = ctx.Done()
 	}
 
-	toProcess := make(chan int, pieces)
-	for i := 0; i < pieces; i++ {
-		toProcess <- i
-	}
-	close(toProcess)
-
 	if pieces < workers {
 		workers = pieces
 	}
-
+	distro := make([][]int, workers)
+	// establish the slices
+	for i := 0; i < workers; i++ {
+		distro = append(distro, []int{i})
+	}
+	// distribute the rest of the work
+	for i := workers; i < pieces; i++ {
+		idx := i % workers
+		distro[idx] = append(distro[idx], i)
+	}
 	wg := sync.WaitGroup{}
 	wg.Add(workers)
 	for i := 0; i < workers; i++ {
-		go func() {
+		go func(pieces []int) {
 			defer utilruntime.HandleCrash()
 			defer wg.Done()
-			for piece := range toProcess {
+			for _, piece := range pieces {
 				select {
 				case <-stop:
 					return
@@ -57,7 +60,7 @@ func ParallelizeUntil(ctx context.Context, workers, pieces int, doWorkPiece DoWo
 					doWorkPiece(piece)
 				}
 			}
-		}()
+		}(distro[i])
 	}
 	wg.Wait()
 }
