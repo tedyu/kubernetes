@@ -18,7 +18,9 @@ package cm
 
 import (
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
+	"sync"
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	internalapi "k8s.io/cri-api/pkg/apis"
@@ -33,8 +35,60 @@ import (
 	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
 )
 
+// CGroupPods records the relationship between Pod UID and its cgroup name
+// CGroupPods wraps the mapping between pod UID and cgroup name with a mutex
+// since the test in TestDeleteOrphanedMirrorPods involves goroutine.
+// The mutex prevents data race.
+type CGroupPods struct {
+	Lock *sync.RWMutex
+	Pods map[types.UID]CgroupName
+}
+
+// Remove deletes all the Pod UIDs which map to the given cgroup name
+func (cgp CGroupPods) Remove(cgroupName CgroupName) {
+	cgp.Lock.Lock()
+	defer cgp.Lock.Unlock()
+
+	for uid, v := range cgp.Pods {
+		if len(v) != len(cgroupName) {
+			continue
+		}
+		found := true
+		for i := range v {
+			if v[i] != cgroupName[i] {
+				found = false
+				break
+			}
+		}
+		if found {
+			delete(cgp.Pods, uid)
+		}
+	}
+}
+
+// GetAllPodsFromCgroups returns map of Pod UID to the cgroup name
+func (cgp CGroupPods) GetAllPodsFromCgroups() map[types.UID]CgroupName {
+	cgp.Lock.RLock()
+	defer cgp.Lock.RUnlock()
+
+	cgroupPods := make(map[types.UID]CgroupName)
+	for k, v := range cgp.Pods {
+		cgroupPods[k] = v
+	}
+	return cgroupPods
+}
+
+// GetCgroupName retrieves cgroup name for the given Pod UID
+func (cgp CGroupPods) GetCgroupName(uid types.UID) CgroupName {
+	cgp.Lock.RLock()
+	defer cgp.Lock.RUnlock()
+	return cgp.Pods[uid]
+}
+
 type containerManagerStub struct {
 	shouldResetExtendedResourceCapacity bool
+	podContainerManager                 *podContainerManagerStub
+	cgroupPods                          *CGroupPods
 }
 
 var _ ContainerManager = &containerManagerStub{}
@@ -90,7 +144,11 @@ func (cm *containerManagerStub) GetDevicePluginResourceCapacity() (v1.ResourceLi
 }
 
 func (cm *containerManagerStub) NewPodContainerManager() PodContainerManager {
-	return &podContainerManagerStub{}
+	if cm.podContainerManager != nil {
+		return cm.podContainerManager
+	}
+	cm.podContainerManager = &podContainerManagerStub{cgroupPods: cm.cgroupPods}
+	return cm.podContainerManager
 }
 
 func (cm *containerManagerStub) GetResources(pod *v1.Pod, container *v1.Container) (*kubecontainer.RunContainerOptions, error) {
@@ -127,6 +185,10 @@ func (cm *containerManagerStub) UpdateAllocatedDevices() {
 
 func NewStubContainerManager() ContainerManager {
 	return &containerManagerStub{shouldResetExtendedResourceCapacity: false}
+}
+
+func NewStubContainerManagerWithCGroupPods(cgroupPods *CGroupPods) ContainerManager {
+	return &containerManagerStub{shouldResetExtendedResourceCapacity: false, cgroupPods: cgroupPods}
 }
 
 func NewStubContainerManagerWithExtendedResource(shouldResetExtendedResourceCapacity bool) ContainerManager {

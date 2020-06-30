@@ -15,6 +15,8 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/kubelet/container:go_default_library",
+        "//pkg/kubelet/pod:go_default_library",
+        "//pkg/kubelet/types:go_default_library",
         "//pkg/volume:go_default_library",
         "//staging/src/k8s.io/api/core/v1:go_default_library",
         "//staging/src/k8s.io/apimachinery/pkg/types:go_default_library",

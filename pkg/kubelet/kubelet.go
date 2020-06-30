@@ -771,6 +771,7 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 
 	klet.backOff = flowcontrol.NewBackOff(backOffPeriod, MaxContainerBackOff)
 	klet.podKillingCh = make(chan *kubecontainer.PodPair, podKillingChannelCapacity)
+	klet.mirrorPodTerminationMap = make(map[string]*GracePeriod)
 
 	// setup eviction manager
 	evictionManager, evictionAdmitHandler := eviction.NewManager(klet.resourceAnalyzer, evictionConfig, killPodNow(klet.podWorkers, kubeDeps.Recorder), klet.podManager.GetMirrorPodByPod, klet.imageManager, klet.containerGC, kubeDeps.Recorder, nodeRef, klet.clock)
@@ -826,6 +827,15 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 
 type serviceLister interface {
 	List(labels.Selector) ([]*v1.Service, error)
+}
+
+// GracePeriod holds information for satisfying graceful termination of pod
+type GracePeriod struct {
+	UID types.UID
+	// Till represents when the grace period expires
+	Till time.Time
+	// Termination is when the pod killer finishes the call to Kubelet#killPod()
+	Termination time.Time
 }
 
 // Kubelet is the main kubelet implementation.
@@ -1060,6 +1070,12 @@ type Kubelet struct {
 
 	// Channel for sending pods to kill.
 	podKillingCh chan *kubecontainer.PodPair
+
+	// lock for synchronization between HandlePodCleanups and pod killer
+	podKillingLock sync.Mutex
+
+	// mirrorPodTerminationMap keeps track of the progress of mirror pod termination
+	mirrorPodTerminationMap map[string]*GracePeriod
 
 	// Information about the ports which are opened by daemons on Node running this Kubelet server.
 	daemonEndpoints *v1.NodeDaemonEndpoints
@@ -2030,6 +2046,28 @@ func (kl *Kubelet) HandlePodUpdates(pods []*v1.Pod) {
 		kl.dispatchWork(pod, kubetypes.SyncPodUpdate, mirrorPod, start)
 	}
 }
+// recordGracePeriod records the expiration of grace period for the pod
+func (kl *Kubelet) recordGracePeriod(pod *v1.Pod) {
+	if !kubetypes.IsMirrorPod(pod) {
+		if _, ok := kl.podManager.GetMirrorPodByPod(pod); ok {
+			var gracePeriod int64
+			if pod.DeletionGracePeriodSeconds != nil {
+				gracePeriod = *pod.DeletionGracePeriodSeconds
+			} else if pod.Spec.TerminationGracePeriodSeconds != nil {
+				gracePeriod = *pod.Spec.TerminationGracePeriodSeconds
+			}
+			if gracePeriod > 0 {
+				fullname := kubecontainer.GetPodFullName(pod)
+				kl.podKillingLock.Lock()
+				kl.mirrorPodTerminationMap[fullname] = &GracePeriod{
+					Till: time.Now().Add(time.Duration(gracePeriod) * time.Second),
+					UID:  pod.UID,
+				}
+				kl.podKillingLock.Unlock()
+			}
+		}
+	}
+}
 
 // HandlePodRemoves is the callback in the SyncHandler interface for pods
 // being removed from a config source.
@@ -2037,6 +2075,7 @@ func (kl *Kubelet) HandlePodRemoves(pods []*v1.Pod) {
 	start := kl.clock.Now()
 	for _, pod := range pods {
 		kl.podManager.DeletePod(pod)
+		kl.recordGracePeriod(pod)
 		if kubetypes.IsMirrorPod(pod) {
 			kl.handleMirrorPod(pod, start)
 			continue
